@@ -1,12 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import anthropic
 import os
-from dotenv import load_dotenv
 from datetime import datetime, timezone
-
-load_dotenv()
 
 app = FastAPI()
 
@@ -17,15 +13,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ALCHEMY_KEY = os.environ.get("ALCHEMY_API_KEY")
-
 @app.get("/")
 def root():
     return {"status": "PolyEdge Bot en ligne"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    return {
+        "status": "ok",
+        "key_found": len(key) > 10,
+        "key_preview": key[:12] + "..." if len(key) > 12 else "VIDE"
+    }
 
 @app.get("/markets")
 async def get_markets(limit: int = 50, hours: int = 72):
@@ -43,7 +42,6 @@ async def get_markets(limit: int = 50, hours: int = 72):
         elif isinstance(data, dict):
             markets = data.get("data", data.get("markets", []))
 
-        # Filter: only markets expiring within next `hours` hours
         now = datetime.now(timezone.utc)
         filtered = []
         for m in markets:
@@ -62,7 +60,6 @@ async def get_markets(limit: int = 50, hours: int = 72):
                 except:
                     pass
 
-        # If no markets in 72h window, return all active markets
         if len(filtered) == 0:
             filtered = markets[:limit]
             for m in filtered:
@@ -90,14 +87,17 @@ async def get_noaa(city_lat: float, city_lng: float):
 
 @app.post("/analyze")
 async def analyze(data: dict):
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    import anthropic as ant
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY manquante"}
 
-    markets = data.get("markets", [])[:10]
+    client = ant.Anthropic(api_key=api_key)
     single_market = data.get("single_market")
+    markets = data.get("markets", [])[:10]
     weather = data.get("weather_cities", [])
 
     if single_market:
-        # Single market analysis with translation
         prompt = f"""Tu es un expert en marchés de prédiction. Analyse ce marché Polymarket :
 
 Question originale (EN): {single_market.get('question', 'N/A')}
@@ -112,7 +112,6 @@ Réponds en français avec exactement ce format :
 💡 RAISON: [explication en 2 phrases maximum]
 ⚠️ RISQUE: [un risque principal]"""
     else:
-        # Full analysis
         markets_text = "\n".join([
             f"- {m.get('question', 'N/A')} | YES: {m.get('yes_price','?')} | Expire: {m.get('hours_left','?')}h"
             for m in markets
@@ -143,12 +142,16 @@ Commence par les marchés avec le meilleur edge potentiel. Sois concis."""
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
-
     return {"analysis": message.content[0].text}
 
 @app.post("/translate")
 async def translate(data: dict):
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    import anthropic as ant
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY manquante"}
+
+    client = ant.Anthropic(api_key=api_key)
     text = data.get("text", "")
     message = client.messages.create(
         model="claude-3-5-sonnet-20241022",
