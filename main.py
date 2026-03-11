@@ -113,6 +113,49 @@ def health():
     return {"status": "ok", "key_found": bool(key), "key_len": len(key)}
 
 
+@app.get("/debug")
+async def debug_markets():
+    """Teste les deux APIs et retourne ce qu'elles renvoient brut."""
+    results = {}
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get("https://gamma-api.polymarket.com/markets?limit=3&active=true&closed=false")
+            data = r.json()
+            first = (data[0] if isinstance(data, list) and data else
+                     (data.get("data", [{}])[0] if isinstance(data, dict) and data.get("data") else {}))
+            results["gamma"] = {
+                "status": r.status_code,
+                "is_list": isinstance(data, list),
+                "count": len(data) if isinstance(data, list) else len(data.get("data", [])),
+                "first_keys": list(first.keys())[:15] if first else [],
+                "acceptingOrders": first.get("acceptingOrders"),
+                "active": first.get("active"),
+                "closed": first.get("closed"),
+                "endDateIso": first.get("endDateIso") or first.get("endDate"),
+                "outcomePrices": first.get("outcomePrices"),
+            }
+        except Exception as e:
+            results["gamma"] = {"error": str(e)}
+
+        try:
+            r2 = await client.get("https://clob.polymarket.com/markets?limit=3&active=true")
+            data2 = r2.json()
+            page = data2.get("data", data2) if isinstance(data2, dict) else data2
+            first2 = page[0] if page else {}
+            results["clob"] = {
+                "status": r2.status_code,
+                "count": len(page),
+                "first_keys": list(first2.keys())[:10] if first2 else [],
+                "accepting_orders": first2.get("accepting_orders"),
+                "active": first2.get("active"),
+                "closed": first2.get("closed"),
+            }
+        except Exception as e:
+            results["clob"] = {"error": str(e)}
+
+    return results
+
+
 @app.get("/markets")
 async def get_markets(limit: int = 50, hours: int = 72):
     """
