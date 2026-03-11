@@ -42,19 +42,21 @@ def is_market_active(m: dict) -> bool:
     return True
 
 def parse_hours_left(m: dict):
-    """Calcule les heures restantes — compatible API Gamma (endDateIso) et CLOB (end_date_iso)."""
+    """Calcule les heures restantes — compatible Gamma et CLOB."""
     now = datetime.now(timezone.utc)
     end_date = (
-        m.get("endDateIso")        # Gamma camelCase
-        or m.get("end_date_iso")   # CLOB snake_case
-        or m.get("endDate")
+        m.get("endDate")
+        or m.get("endDateIso")
+        or m.get("end_date_iso")
         or m.get("end_date")
         or m.get("expiration")
     )
     if not end_date:
         return None
     try:
-        if end_date.endswith("Z"):
+        if len(end_date) == 10:
+            end_date = end_date + "T23:59:59+00:00"
+        elif end_date.endswith("Z"):
             end_date = end_date[:-1] + "+00:00"
         exp = datetime.fromisoformat(end_date)
         if exp.tzinfo is None:
@@ -157,7 +159,7 @@ async def debug_markets():
 
 
 @app.get("/markets")
-async def get_markets(limit: int = 50, hours: int = 72):
+async def get_markets(limit: int = 50, hours: int = 720):
     """
     Retourne uniquement les marchés ACTIFS, non résolus,
     qui expirent dans la fenêtre `hours` demandée.
