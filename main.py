@@ -17,8 +17,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
-ALCHEMY_KEY = os.getenv("ALCHEMY_API_KEY")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ALCHEMY_KEY = os.environ.get("ALCHEMY_API_KEY")
 
 @app.get("/")
 def root():
