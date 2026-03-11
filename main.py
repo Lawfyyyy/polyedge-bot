@@ -12,28 +12,45 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ─── Helpers ───────────────────────────────────────────────
 
 def is_market_active(m: dict) -> bool:
-    """Vérifie qu'un marché est vraiment tradable (pas résolu, accepting orders)."""
+    """Vérifie qu'un marché est vraiment tradable — compatible API Gamma."""
     if m.get("closed") or not m.get("active"):
         return False
-    if not m.get("accepting_orders"):
+    # Gamma utilise acceptingOrders (camelCase)
+    if not m.get("acceptingOrders", m.get("accepting_orders", False)):
         return False
-    tokens = m.get("tokens", [])
-    if not tokens:
-        return False
-    for t in tokens:
+    # Prix via outcomePrices (Gamma) ou tokens (CLOB)
+    prices_raw = m.get("outcomePrices")
+    if prices_raw:
         try:
-            price = float(t.get("price", 0))
-        except (TypeError, ValueError):
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            prices = [float(p) for p in prices]
+        except Exception:
             return False
-        # Prix à 0 ou 1 = marché déjà résolu
-        if price <= 0.005 or price >= 0.995:
+    else:
+        tokens = m.get("tokens", [])
+        if not tokens:
             return False
+        prices = []
+        for t in tokens:
+            try:
+                prices.append(float(t.get("price", 0)))
+            except (TypeError, ValueError):
+                return False
+    # Tous les prix à 0 ou 1 = marché déjà résolu
+    if all(p <= 0.005 or p >= 0.995 for p in prices):
+        return False
     return True
 
 def parse_hours_left(m: dict):
-    """Calcule les heures restantes avant expiration. Retourne None si expiré."""
+    """Calcule les heures restantes — compatible API Gamma (endDateIso) et CLOB (end_date_iso)."""
     now = datetime.now(timezone.utc)
-    end_date = m.get("end_date_iso") or m.get("end_date") or m.get("expiration")
+    end_date = (
+        m.get("endDateIso")        # Gamma camelCase
+        or m.get("end_date_iso")   # CLOB snake_case
+        or m.get("endDate")
+        or m.get("end_date")
+        or m.get("expiration")
+    )
     if not end_date:
         return None
     try:
@@ -128,7 +145,22 @@ async def get_markets(limit: int = 50, hours: int = 72):
         return filtered[:limit]
 
 
-@app.get("/markets/recommended")
+def get_yes_price(m: dict) -> float:
+    """Extrait le prix YES — compatible Gamma (outcomePrices) et CLOB (tokens)."""
+    prices_raw = m.get("outcomePrices")
+    if prices_raw:
+        try:
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            return float(prices[0])
+        except Exception:
+            pass
+    tokens = m.get("tokens") or []
+    if tokens:
+        try:
+            return float(tokens[0].get("price", 0.5))
+        except Exception:
+            pass
+    return 0.5
 async def get_recommended_markets():
     """
     Claude scanne jusqu'à 30 jours de marchés et sélectionne
@@ -155,7 +187,7 @@ async def get_recommended_markets():
     by_urgency = sorted(candidates, key=lambda m: m.get("hours_left", 9999))[:15]
     by_balance = sorted(
         candidates,
-        key=lambda m: abs(float((m.get("tokens") or [{"price": 0.5}])[0].get("price", 0.5)) - 0.5)
+        key=lambda m: abs(get_yes_price(m) - 0.5)
     )[:15]
 
     pool = list({m["condition_id"]: m for m in by_urgency + by_balance}.values())[:30]
@@ -166,7 +198,7 @@ async def get_recommended_markets():
 
     markets_text = "\n".join([
         f"{i+1}. [{round(m.get('hours_left', 0))}h] {m.get('question', '?')} | "
-        f"YES={float((m.get('tokens') or [{'price': 0}])[0].get('price', 0)):.2f}"
+        f"YES={get_yes_price(m):.2f}"
         for i, m in enumerate(pool)
     ])
 
