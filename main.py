@@ -140,7 +140,7 @@ Pour chaque marché donne en français :
 Commence par les marchés avec le meilleur edge potentiel. Sois concis."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -152,7 +152,7 @@ async def translate(data: dict):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     text = data.get("text", "")
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=200,
         messages=[{
             "role": "user",
