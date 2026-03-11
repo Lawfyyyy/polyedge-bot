@@ -64,7 +64,7 @@ async def translate(data: dict):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         max_tokens=100,
         messages=[{"role": "user", "content": f"Traduis cette question de marché en français en une phrase courte: {data.get('text','')}"}]
     )
@@ -100,7 +100,7 @@ MÉTÉO NOAA :
 {weather_text}
 Pour chaque marché en français : traduction, signal OUI/NON, confiance %, raison courte. Commence par les meilleurs edges."""
     msg = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
