@@ -48,30 +48,39 @@ def parse_hours_left(m: dict):
         return None
 
 async def fetch_active_markets(client: httpx.AsyncClient, max_pages: int = 8) -> list:
-    """Pagine l'API Polymarket et retourne tous les marchés actifs trouvés."""
+    """Utilise l'API Gamma de Polymarket — tri par date d'expiration croissante."""
     all_markets = []
-    next_cursor = None
+    offset = 0
+    limit = 100
 
     for _ in range(max_pages):
-        params = {"limit": 100, "active": "true"}
-        if next_cursor:
-            params["next_cursor"] = next_cursor
         try:
-            res = await client.get("https://clob.polymarket.com/markets", params=params)
+            res = await client.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "limit": limit,
+                    "offset": offset,
+                    "active": "true",
+                    "closed": "false",
+                    "order": "end_date_iso",
+                    "ascending": "true",
+                },
+                timeout=20,
+            )
             data = res.json()
         except Exception:
             break
 
         if isinstance(data, list):
             page_markets = data
-            next_cursor = None
         else:
             page_markets = data.get("data", data.get("markets", []))
-            next_cursor = data.get("next_cursor")
+
+        if not page_markets:
+            break
 
         all_markets.extend(page_markets)
-        if not next_cursor:
-            break
+        offset += limit
 
     return all_markets
 
