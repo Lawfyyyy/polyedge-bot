@@ -9,8 +9,6 @@ from datetime import datetime, timezone
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ─── Helpers ───────────────────────────────────────────────
-
 def get_yes_price(m: dict) -> float:
     prices_raw = m.get("outcomePrices")
     if prices_raw:
@@ -27,7 +25,7 @@ def get_yes_price(m: dict) -> float:
             pass
     return 0.5
 
-def parse_hours_left(end_date: str) -> float | None:
+def parse_hours_left(end_date: str):
     if not end_date:
         return None
     now = datetime.now(timezone.utc)
@@ -45,15 +43,21 @@ def parse_hours_left(end_date: str) -> float | None:
     except Exception:
         return None
 
-async def fetch_gamma_markets(client: httpx.AsyncClient, max_pages: int = 8) -> list:
+async def fetch_gamma_markets(client: httpx.AsyncClient, max_pages: int = 20) -> list:
+    """Scanne jusqu'à 2000 marchés Gamma sans filtre temporel."""
     all_markets = []
     offset = 0
     for _ in range(max_pages):
         try:
             r = await client.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"limit": 100, "offset": offset, "active": "true", "closed": "false"},
-                timeout=20,
+                params={
+                    "limit": 100,
+                    "offset": offset,
+                    "active": "true",
+                    "closed": "false",
+                },
+                timeout=25,
             )
             data = r.json()
         except Exception:
@@ -65,46 +69,23 @@ async def fetch_gamma_markets(client: httpx.AsyncClient, max_pages: int = 8) -> 
         offset += 100
     return all_markets
 
-# ─── Routes ────────────────────────────────────────────────
-
 @app.get("/")
 def root():
-    return {"status": "PolyEdge Bot en ligne", "version": "3.0"}
+    return {"status": "PolyEdge Bot en ligne", "version": "4.0"}
 
 @app.get("/health")
 def health():
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     return {"status": "ok", "key_found": bool(key), "key_len": len(key)}
 
-@app.get("/debug")
-async def debug():
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get("https://gamma-api.polymarket.com/markets?limit=3&active=true&closed=false")
-            data = r.json()
-            page = data if isinstance(data, list) else data.get("data", [])
-            first = page[0] if page else {}
-            end = first.get("endDate") or first.get("endDateIso", "")
-            hours = parse_hours_left(end)
-            return {
-                "status": r.status_code,
-                "count_returned": len(page),
-                "first_question": first.get("question"),
-                "active": first.get("active"),
-                "closed": first.get("closed"),
-                "acceptingOrders": first.get("acceptingOrders"),
-                "endDate": end,
-                "hours_left_calculated": hours,
-                "outcomePrices": first.get("outcomePrices"),
-                "yes_price": get_yes_price(first),
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
 @app.get("/markets")
-async def get_markets(limit: int = 50, hours: int = 720):
-    async with httpx.AsyncClient(timeout=30) as client:
-        all_markets = await fetch_gamma_markets(client, max_pages=6)
+async def get_markets(limit: int = 200, hours: int = 8760):
+    """
+    Retourne tous les marchés actifs — pas de limite temporelle stricte.
+    hours = filtre optionnel (défaut 1 an = tout garder)
+    """
+    async with httpx.AsyncClient(timeout=60) as client:
+        all_markets = await fetch_gamma_markets(client, max_pages=20)
 
     result = []
     for m in all_markets:
@@ -112,115 +93,35 @@ async def get_markets(limit: int = 50, hours: int = 720):
             continue
         if not m.get("acceptingOrders"):
             continue
-
-        # Prix entre 0.02 et 0.98
         yes_price = get_yes_price(m)
-        if yes_price <= 0.02 or yes_price >= 0.98:
+        # Filtre souple: exclure seulement les marchés déjà résolus (0 ou 1)
+        if yes_price <= 0.01 or yes_price >= 0.99:
             continue
-
-        # Heures restantes
         end = m.get("endDate") or m.get("endDateIso", "")
         h = parse_hours_left(end)
-        if h is None or h <= 0:
-            continue
-        if h > hours:
-            continue
-
+        # Garder même sans date connue
         m["hours_left"] = h
         m["yes_price"] = yes_price
         result.append(m)
 
-    result.sort(key=lambda m: m["hours_left"])
+    # Tri: marchés avec date d'abord (urgents en tête), puis sans date
+    result.sort(key=lambda m: m.get("hours_left") or 99999)
     return result[:limit]
 
-@app.get("/markets/recommended")
-async def get_recommended_markets():
-    async with httpx.AsyncClient(timeout=30) as client:
-        all_markets = await fetch_gamma_markets(client, max_pages=8)
-
-    candidates = []
-    for m in all_markets:
-        if not m.get("active") or m.get("closed"):
-            continue
-        if not m.get("acceptingOrders"):
-            continue
-        yes_price = get_yes_price(m)
-        if yes_price <= 0.05 or yes_price >= 0.95:
-            continue
-        end = m.get("endDate") or m.get("endDateIso", "")
-        h = parse_hours_left(end)
-        if h is None or h <= 0 or h > 720:
-            continue
-        m["hours_left"] = h
-        m["yes_price"] = yes_price
-        candidates.append(m)
-
-    if not candidates:
-        return {"markets": [], "total_scanned": len(all_markets)}
-
-    by_urgency = sorted(candidates, key=lambda m: m["hours_left"])[:15]
-    by_balance = sorted(candidates, key=lambda m: abs(m["yes_price"] - 0.5))[:15]
-    pool = list({m["id"]: m for m in by_urgency + by_balance}.values())[:30]
-
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    ai_client = anthropic.Anthropic(api_key=key)
-
-    markets_text = "\n".join([
-        f"{i+1}. [{round(m['hours_left'])}h] {m.get('question','?')} | YES={m['yes_price']:.2f}"
-        for i, m in enumerate(pool)
-    ])
-
-    prompt = f"""Tu es un expert en marchés de prédiction Polymarket.
-
-Voici {len(pool)} marchés actifs (format: [heures restantes] question | prix YES) :
-
-{markets_text}
-
-Sélectionne les 8 marchés les plus intéressants à trader MAINTENANT.
-Critères : vraie incertitude (prix 0.10-0.90), enjeu mesurable, potentiel d'edge.
-
-Réponds UNIQUEMENT en JSON strict :
-{{
-  "recommended": [
-    {{
-      "index": <numéro 1-{len(pool)}>,
-      "signal": "OUI" ou "NON",
-      "confiance": <50-95>,
-      "raison": "<1 phrase directe en français>",
-      "edge": "<pourquoi ce marché est potentiellement mal pricé>"
-    }}
-  ]
-}}"""
-
-    try:
-        msg = ai_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1200,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = msg.content[0].text.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        result = json.loads(raw.strip())
-        recommendations = result.get("recommended", [])
-    except Exception as e:
-        return {"markets": pool, "total_scanned": len(candidates), "error": str(e)}
-
-    enriched = []
-    for rec in recommendations:
-        idx = rec.get("index", 1) - 1
-        if 0 <= idx < len(pool):
-            market = pool[idx].copy()
-            market["_ai_signal"] = rec.get("signal")
-            market["_ai_confiance"] = rec.get("confiance")
-            market["_ai_raison"] = rec.get("raison")
-            market["_ai_edge"] = rec.get("edge")
-            market["_recommended"] = True
-            enriched.append(market)
-
-    return {"markets": enriched, "total_scanned": len(candidates)}
+@app.get("/debug")
+async def debug():
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get("https://gamma-api.polymarket.com/markets?limit=5&active=true&closed=false")
+            data = r.json()
+            page = data if isinstance(data, list) else data.get("data", [])
+            return {
+                "status": r.status_code,
+                "count": len(page),
+                "samples": [{"q": m.get("question","")[:60], "yp": get_yes_price(m), "h": parse_hours_left(m.get("endDate") or m.get("endDateIso",""))} for m in page[:3]]
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
 @app.get("/noaa/{city_lat}/{city_lng}")
 async def get_noaa(city_lat: float, city_lng: float):
@@ -258,47 +159,77 @@ async def analyze(data: dict):
     single_market = data.get("single_market")
     markets = data.get("markets", [])[:10]
     weather = data.get("weather_cities", [])
+    news_search = data.get("news_search", False)
 
-    if single_market:
+    if news_search:
+        query = data.get("query", "polymarket trending")
+        mkt_ctx = "\n".join([f"- {m.get('question','')[:80]} | YES={m.get('yes_price','?')}" for m in data.get("markets", [])[:8]])
+        prompt = f"""Tu es un analyste de marchés de prédiction. Fais une revue d'actualités pertinentes pour ces marchés Polymarket ouverts.
+
+MARCHÉS OUVERTS :
+{mkt_ctx}
+
+REQUÊTE : {query}
+
+Génère 8-12 actualités récentes et pertinentes (réelles ou très probables étant donné les marchés ouverts).
+Pour chaque actualité, indique :
+- La source (Reuters, AP, BBC, Bloomberg, ESPN, etc.)
+- La date approximative (aujourd'hui = 11 mars 2026)
+- Le titre accrocheur
+- 2 phrases de contexte
+- Impact sur les marchés (FORT/MODÉRÉ/FAIBLE)
+- Quel(s) marché(s) sont concernés
+
+Format pour chaque item :
+SOURCE: [nom] | DATE: [date] | IMPACT: [niveau]
+TITRE: [titre]
+CONTEXTE: [2 phrases]
+MARCHÉS: [marchés liés]
+---"""
+
+    elif single_market:
         weather_ctx = ""
         if single_market.get("weather_context"):
             wc = single_market["weather_context"]
-            weather_ctx = f"\nContexte météo {wc.get('city','')}: {wc.get('avg_temp','?')}°F · pluie {wc.get('rain_chance','?')}%"
+            weather_ctx = f"\nMétéo {wc.get('city','')}: {wc.get('avg_temp','?')}°F · pluie {wc.get('rain_chance','?')}%"
 
-        prompt = f"""Tu es expert Polymarket. Analyse ce marché en français. Sois direct et actionnable.
+        prompt = f"""Tu es expert Polymarket. Analyse ce marché. Sois direct et actionnable.
 
 Question: {single_market.get('question','N/A')}
-Prix YES: {single_market.get('yes_price','N/A')}
-Prix NO: {single_market.get('no_price','N/A')}
-Expire dans: {single_market.get('hours_left','N/A')} heures{weather_ctx}
+Prix YES: {single_market.get('yes_price','N/A')} | Prix NO: {single_market.get('no_price','N/A')}
+Expire dans: {single_market.get('hours_left','N/A')} heures
+Volume 24h: ${single_market.get('volume_24h',0):,.0f} | Liquidité: ${single_market.get('liquidity',0):,.0f}{weather_ctx}
 
-Réponds avec ce format exact :
+Format EXACT (une ligne par item) :
 📊 SIGNAL: OUI / NON / ABSTENTION
 💯 CONFIANCE: XX%
-💡 RAISON: [2 phrases max]
+💡 RAISON: [2 phrases max, factuel]
 ⚠️ RISQUE: [1 risque principal]
-🎯 EDGE: [En quoi ce marché est potentiellement mal pricé]"""
+🎯 EDGE: [écart estimé entre prix affiché et probabilité réelle, ex: +15pts]"""
 
     else:
         markets_text = "\n".join([
-            f"- {m.get('question','N/A')} | YES: {m.get('yes_price', get_yes_price(m))} | {m.get('hours_left','?')}h"
-            for m in markets
+            f"{i+1}. {m.get('question','N/A')} | YES:{(m.get('tokens') or [{}])[0].get('price', m.get('yes_price','?'))} | {m.get('hours_left','?')}h"
+            for i, m in enumerate(markets)
         ])
         weather_text = "\n".join([
             f"- {w['city']}: {w.get('avg_temp','?')}°F · pluie {w.get('rain_chance','?')}%"
             for w in weather
         ]) if weather else "Aucune donnée météo"
 
-        prompt = f"""Tu es expert en marchés de prédiction Polymarket. Analyse en français, sois direct.
+        prompt = f"""Tu es expert en marchés de prédiction Polymarket. Analyse ces marchés en français.
 
-MARCHÉS ACTIFS :
+MARCHÉS :
 {markets_text}
 
-DONNÉES MÉTÉO :
+MÉTÉO :
 {weather_text}
 
-Pour chaque marché : signal OUI/NON/ABSTENTION + confiance % + raison 1 phrase + edge potentiel.
-Classe du meilleur edge au pire."""
+Pour chaque marché (du meilleur edge au pire) :
+📊 SIGNAL: OUI/NON/ABSTENTION
+💯 CONFIANCE: XX%
+💡 RAISON: [1 phrase]
+🎯 EDGE: [+/-Xpts vs prix affiché]"""
 
     msg = client.messages.create(
         model="claude-sonnet-4-6",
