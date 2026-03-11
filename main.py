@@ -17,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ALCHEMY_KEY = os.environ.get("ALCHEMY_API_KEY")
 
 @app.get("/")
@@ -91,7 +90,7 @@ async def get_noaa(city_lat: float, city_lng: float):
 
 @app.post("/analyze")
 async def analyze(data: dict):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     markets = data.get("markets", [])[:10]
     single_market = data.get("single_market")
@@ -149,7 +148,7 @@ Commence par les marchés avec le meilleur edge potentiel. Sois concis."""
 
 @app.post("/translate")
 async def translate(data: dict):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     text = data.get("text", "")
     message = client.messages.create(
         model="claude-3-5-sonnet-20241022",
