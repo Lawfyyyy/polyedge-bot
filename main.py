@@ -88,7 +88,7 @@ async def get_noaa(city_lat: float, city_lng: float):
 @app.post("/analyze")
 async def analyze(data: dict):
     import anthropic as ant
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = "sk-ant-api03-TACLÉICI"
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY manquante"}
 
@@ -147,7 +147,7 @@ Commence par les marchés avec le meilleur edge potentiel. Sois concis."""
 @app.post("/translate")
 async def translate(data: dict):
     import anthropic as ant
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = "sk-ant-api03-TACLÉICI"
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY manquante"}
 
