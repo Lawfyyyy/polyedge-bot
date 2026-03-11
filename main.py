@@ -11,187 +11,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ─── Helpers ───────────────────────────────────────────────
 
-def is_market_active(m: dict) -> bool:
-    """Vérifie qu'un marché est vraiment tradable — compatible API Gamma."""
-    if m.get("closed") or not m.get("active"):
-        return False
-    # Gamma utilise acceptingOrders (camelCase)
-    if not m.get("acceptingOrders", m.get("accepting_orders", False)):
-        return False
-    # Prix via outcomePrices (Gamma) ou tokens (CLOB)
-    prices_raw = m.get("outcomePrices")
-    if prices_raw:
-        try:
-            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-            prices = [float(p) for p in prices]
-        except Exception:
-            return False
-    else:
-        tokens = m.get("tokens", [])
-        if not tokens:
-            return False
-        prices = []
-        for t in tokens:
-            try:
-                prices.append(float(t.get("price", 0)))
-            except (TypeError, ValueError):
-                return False
-    # Tous les prix à 0 ou 1 = marché déjà résolu
-    if all(p <= 0.005 or p >= 0.995 for p in prices):
-        return False
-    return True
-
-def parse_hours_left(m: dict):
-    """Calcule les heures restantes — compatible Gamma et CLOB."""
-    now = datetime.now(timezone.utc)
-    end_date = (
-        m.get("endDate")
-        or m.get("endDateIso")
-        or m.get("end_date_iso")
-        or m.get("end_date")
-        or m.get("expiration")
-    )
-    if not end_date:
-        return None
-    try:
-        if len(end_date) == 10:
-            end_date = end_date + "T23:59:59+00:00"
-        elif end_date.endswith("Z"):
-            end_date = end_date[:-1] + "+00:00"
-        exp = datetime.fromisoformat(end_date)
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        diff = (exp - now).total_seconds() / 3600
-        return round(diff, 1) if diff > 0 else None
-    except Exception:
-        return None
-
-async def fetch_active_markets(client: httpx.AsyncClient, max_pages: int = 8) -> list:
-    """Utilise l'API Gamma de Polymarket — tri par date d'expiration croissante."""
-    all_markets = []
-    offset = 0
-    limit = 100
-
-    for _ in range(max_pages):
-        try:
-            res = await client.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={
-                    "limit": limit,
-                    "offset": offset,
-                    "active": "true",
-                    "closed": "false",
-                    "order": "end_date_iso",
-                    "ascending": "true",
-                },
-                timeout=20,
-            )
-            data = res.json()
-        except Exception:
-            break
-
-        if isinstance(data, list):
-            page_markets = data
-        else:
-            page_markets = data.get("data", data.get("markets", []))
-
-        if not page_markets:
-            break
-
-        all_markets.extend(page_markets)
-        offset += limit
-
-    return all_markets
-
-# ─── Routes ────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"status": "PolyEdge Bot en ligne", "version": "2.0"}
-
-@app.get("/health")
-def health():
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    return {"status": "ok", "key_found": bool(key), "key_len": len(key)}
-
-
-@app.get("/debug")
-async def debug_markets():
-    """Teste les deux APIs et retourne ce qu'elles renvoient brut."""
-    results = {}
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get("https://gamma-api.polymarket.com/markets?limit=3&active=true&closed=false")
-            data = r.json()
-            first = (data[0] if isinstance(data, list) and data else
-                     (data.get("data", [{}])[0] if isinstance(data, dict) and data.get("data") else {}))
-            results["gamma"] = {
-                "status": r.status_code,
-                "is_list": isinstance(data, list),
-                "count": len(data) if isinstance(data, list) else len(data.get("data", [])),
-                "first_keys": list(first.keys())[:15] if first else [],
-                "acceptingOrders": first.get("acceptingOrders"),
-                "active": first.get("active"),
-                "closed": first.get("closed"),
-                "endDateIso": first.get("endDateIso") or first.get("endDate"),
-                "outcomePrices": first.get("outcomePrices"),
-            }
-        except Exception as e:
-            results["gamma"] = {"error": str(e)}
-
-        try:
-            r2 = await client.get("https://clob.polymarket.com/markets?limit=3&active=true")
-            data2 = r2.json()
-            page = data2.get("data", data2) if isinstance(data2, dict) else data2
-            first2 = page[0] if page else {}
-            results["clob"] = {
-                "status": r2.status_code,
-                "count": len(page),
-                "first_keys": list(first2.keys())[:10] if first2 else [],
-                "accepting_orders": first2.get("accepting_orders"),
-                "active": first2.get("active"),
-                "closed": first2.get("closed"),
-            }
-        except Exception as e:
-            results["clob"] = {"error": str(e)}
-
-    return results
-
-
-@app.get("/markets")
-async def get_markets(limit: int = 50, hours: int = 720):
-    """
-    Retourne uniquement les marchés ACTIFS, non résolus,
-    qui expirent dans la fenêtre `hours` demandée.
-    Trie par urgence (plus urgent en premier).
-    """
-    async with httpx.AsyncClient(timeout=20) as client:
-        all_markets = await fetch_active_markets(client, max_pages=6)
-
-        filtered = []
-        for m in all_markets:
-            # Filtre strict : actif + prix entre 0.01 et 0.99
-            if not is_market_active(m):
-                continue
-            # Heures restantes
-            h = parse_hours_left(m)
-            if h is None:
-                continue
-            # Fenêtre temporelle demandée
-            if not (0 < h <= hours):
-                continue
-
-            m["hours_left"] = h
-            filtered.append(m)
-
-        # Tri : plus urgent en premier
-        filtered.sort(key=lambda m: m.get("hours_left", 9999))
-
-        return filtered[:limit]
-
-
 def get_yes_price(m: dict) -> float:
-    """Extrait le prix YES — compatible Gamma (outcomePrices) et CLOB (tokens)."""
     prices_raw = m.get("outcomePrices")
     if prices_raw:
         try:
@@ -206,44 +26,147 @@ def get_yes_price(m: dict) -> float:
         except Exception:
             pass
     return 0.5
-async def get_recommended_markets():
-    """
-    Claude scanne jusqu'à 30 jours de marchés et sélectionne
-    lui-même les plus intéressants à trader, sans contrainte de date.
-    """
-    async with httpx.AsyncClient(timeout=25) as client:
-        all_markets = await fetch_active_markets(client, max_pages=8)
 
-    # Garder seulement les marchés actifs (fenêtre large : 30 jours)
+def parse_hours_left(end_date: str) -> float | None:
+    if not end_date:
+        return None
+    now = datetime.now(timezone.utc)
+    try:
+        s = end_date.strip()
+        if len(s) == 10:
+            s = s + "T23:59:59+00:00"
+        elif s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        exp = datetime.fromisoformat(s)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        diff = (exp - now).total_seconds() / 3600
+        return round(diff, 1) if diff > 0 else None
+    except Exception:
+        return None
+
+async def fetch_gamma_markets(client: httpx.AsyncClient, max_pages: int = 8) -> list:
+    all_markets = []
+    offset = 0
+    for _ in range(max_pages):
+        try:
+            r = await client.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"limit": 100, "offset": offset, "active": "true", "closed": "false"},
+                timeout=20,
+            )
+            data = r.json()
+        except Exception:
+            break
+        page = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+        if not page:
+            break
+        all_markets.extend(page)
+        offset += 100
+    return all_markets
+
+# ─── Routes ────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "PolyEdge Bot en ligne", "version": "3.0"}
+
+@app.get("/health")
+def health():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    return {"status": "ok", "key_found": bool(key), "key_len": len(key)}
+
+@app.get("/debug")
+async def debug():
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get("https://gamma-api.polymarket.com/markets?limit=3&active=true&closed=false")
+            data = r.json()
+            page = data if isinstance(data, list) else data.get("data", [])
+            first = page[0] if page else {}
+            end = first.get("endDate") or first.get("endDateIso", "")
+            hours = parse_hours_left(end)
+            return {
+                "status": r.status_code,
+                "count_returned": len(page),
+                "first_question": first.get("question"),
+                "active": first.get("active"),
+                "closed": first.get("closed"),
+                "acceptingOrders": first.get("acceptingOrders"),
+                "endDate": end,
+                "hours_left_calculated": hours,
+                "outcomePrices": first.get("outcomePrices"),
+                "yes_price": get_yes_price(first),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+@app.get("/markets")
+async def get_markets(limit: int = 50, hours: int = 720):
+    async with httpx.AsyncClient(timeout=30) as client:
+        all_markets = await fetch_gamma_markets(client, max_pages=6)
+
+    result = []
+    for m in all_markets:
+        if not m.get("active") or m.get("closed"):
+            continue
+        if not m.get("acceptingOrders"):
+            continue
+
+        # Prix entre 0.02 et 0.98
+        yes_price = get_yes_price(m)
+        if yes_price <= 0.02 or yes_price >= 0.98:
+            continue
+
+        # Heures restantes
+        end = m.get("endDate") or m.get("endDateIso", "")
+        h = parse_hours_left(end)
+        if h is None or h <= 0:
+            continue
+        if h > hours:
+            continue
+
+        m["hours_left"] = h
+        m["yes_price"] = yes_price
+        result.append(m)
+
+    result.sort(key=lambda m: m["hours_left"])
+    return result[:limit]
+
+@app.get("/markets/recommended")
+async def get_recommended_markets():
+    async with httpx.AsyncClient(timeout=30) as client:
+        all_markets = await fetch_gamma_markets(client, max_pages=8)
+
     candidates = []
     for m in all_markets:
-        if not is_market_active(m):
+        if not m.get("active") or m.get("closed"):
             continue
-        h = parse_hours_left(m)
-        if h is None or h <= 0 or h > 720:  # max 30 jours
+        if not m.get("acceptingOrders"):
+            continue
+        yes_price = get_yes_price(m)
+        if yes_price <= 0.05 or yes_price >= 0.95:
+            continue
+        end = m.get("endDate") or m.get("endDateIso", "")
+        h = parse_hours_left(end)
+        if h is None or h <= 0 or h > 720:
             continue
         m["hours_left"] = h
+        m["yes_price"] = yes_price
         candidates.append(m)
 
     if not candidates:
-        return {"markets": [], "total_scanned": 0}
+        return {"markets": [], "total_scanned": len(all_markets)}
 
-    # Mix : urgents + prix équilibrés (plus d'incertitude = plus d'edge potentiel)
-    by_urgency = sorted(candidates, key=lambda m: m.get("hours_left", 9999))[:15]
-    by_balance = sorted(
-        candidates,
-        key=lambda m: abs(get_yes_price(m) - 0.5)
-    )[:15]
+    by_urgency = sorted(candidates, key=lambda m: m["hours_left"])[:15]
+    by_balance = sorted(candidates, key=lambda m: abs(m["yes_price"] - 0.5))[:15]
+    pool = list({m["id"]: m for m in by_urgency + by_balance}.values())[:30]
 
-    pool = list({m["condition_id"]: m for m in by_urgency + by_balance}.values())[:30]
-
-    # Demande à Claude de choisir les 8 meilleurs
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     ai_client = anthropic.Anthropic(api_key=key)
 
     markets_text = "\n".join([
-        f"{i+1}. [{round(m.get('hours_left', 0))}h] {m.get('question', '?')} | "
-        f"YES={get_yes_price(m):.2f}"
+        f"{i+1}. [{round(m['hours_left'])}h] {m.get('question','?')} | YES={m['yes_price']:.2f}"
         for i, m in enumerate(pool)
     ])
 
@@ -254,14 +177,9 @@ Voici {len(pool)} marchés actifs (format: [heures restantes] question | prix YE
 {markets_text}
 
 Sélectionne les 8 marchés les plus intéressants à trader MAINTENANT.
+Critères : vraie incertitude (prix 0.10-0.90), enjeu mesurable, potentiel d'edge.
 
-Critères :
-- Prix YES entre 0.10 et 0.90 (vraie incertitude)
-- Question avec un enjeu mesurable et vérifiable
-- Potentiel d'edge (actualité, données disponibles, marché mal pricé)
-- Bon ratio risque/récompense
-
-Réponds UNIQUEMENT en JSON strict, sans texte avant ni après :
+Réponds UNIQUEMENT en JSON strict :
 {{
   "recommended": [
     {{
@@ -281,7 +199,6 @@ Réponds UNIQUEMENT en JSON strict, sans texte avant ni après :
             messages=[{"role": "user", "content": prompt}]
         )
         raw = msg.content[0].text.strip()
-        # Nettoyer les backticks si présents
         if "```" in raw:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -291,21 +208,19 @@ Réponds UNIQUEMENT en JSON strict, sans texte avant ni après :
     except Exception as e:
         return {"markets": pool, "total_scanned": len(candidates), "error": str(e)}
 
-    # Enrichir avec les données IA
     enriched = []
     for rec in recommendations:
         idx = rec.get("index", 1) - 1
         if 0 <= idx < len(pool):
             market = pool[idx].copy()
-            market["_ai_signal"]    = rec.get("signal")
+            market["_ai_signal"] = rec.get("signal")
             market["_ai_confiance"] = rec.get("confiance")
-            market["_ai_raison"]    = rec.get("raison")
-            market["_ai_edge"]      = rec.get("edge")
-            market["_recommended"]  = True
+            market["_ai_raison"] = rec.get("raison")
+            market["_ai_edge"] = rec.get("edge")
+            market["_recommended"] = True
             enriched.append(market)
 
     return {"markets": enriched, "total_scanned": len(candidates)}
-
 
 @app.get("/noaa/{city_lat}/{city_lng}")
 async def get_noaa(city_lat: float, city_lng: float):
@@ -324,18 +239,16 @@ async def get_noaa(city_lat: float, city_lng: float):
             "avg_temp": sum(p["temperature"] for p in periods) / len(periods)
         }
 
-
 @app.post("/translate")
 async def translate(data: dict):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=120,
         messages=[{"role": "user", "content": f"Traduis cette question de marché Polymarket en français, en une phrase courte et naturelle. Juste la traduction, rien d'autre: {data.get('text', '')}"}]
     )
     return {"translation": msg.content[0].text.strip()}
-
 
 @app.post("/analyze")
 async def analyze(data: dict):
@@ -343,23 +256,23 @@ async def analyze(data: dict):
     client = anthropic.Anthropic(api_key=key)
 
     single_market = data.get("single_market")
-    markets       = data.get("markets", [])[:10]
-    weather       = data.get("weather_cities", [])
+    markets = data.get("markets", [])[:10]
+    weather = data.get("weather_cities", [])
 
     if single_market:
         weather_ctx = ""
         if single_market.get("weather_context"):
             wc = single_market["weather_context"]
-            weather_ctx = f"\nContexte météo {wc.get('city', '')}: {wc.get('avg_temp', '?')}°F · pluie {wc.get('rain_chance', '?')}%"
+            weather_ctx = f"\nContexte météo {wc.get('city','')}: {wc.get('avg_temp','?')}°F · pluie {wc.get('rain_chance','?')}%"
 
         prompt = f"""Tu es expert Polymarket. Analyse ce marché en français. Sois direct et actionnable.
 
-Question: {single_market.get('question', 'N/A')}
-Prix YES: {single_market.get('yes_price', 'N/A')}
-Prix NO: {single_market.get('no_price', 'N/A')}
-Expire dans: {single_market.get('hours_left', 'N/A')} heures{weather_ctx}
+Question: {single_market.get('question','N/A')}
+Prix YES: {single_market.get('yes_price','N/A')}
+Prix NO: {single_market.get('no_price','N/A')}
+Expire dans: {single_market.get('hours_left','N/A')} heures{weather_ctx}
 
-Réponds avec ce format exact, une ligne par item :
+Réponds avec ce format exact :
 📊 SIGNAL: OUI / NON / ABSTENTION
 💯 CONFIANCE: XX%
 💡 RAISON: [2 phrases max]
@@ -368,13 +281,13 @@ Réponds avec ce format exact, une ligne par item :
 
     else:
         markets_text = "\n".join([
-            f"- {m.get('question', 'N/A')} | YES: {(m.get('tokens') or [{}])[0].get('price', '?')} | {m.get('hours_left', '?')}h"
+            f"- {m.get('question','N/A')} | YES: {m.get('yes_price', get_yes_price(m))} | {m.get('hours_left','?')}h"
             for m in markets
         ])
         weather_text = "\n".join([
-            f"- {w['city']}: {w.get('avg_temp', '?')}°F · pluie {w.get('rain_chance', '?')}%"
+            f"- {w['city']}: {w.get('avg_temp','?')}°F · pluie {w.get('rain_chance','?')}%"
             for w in weather
-        ]) if weather else "Aucune donnée météo chargée"
+        ]) if weather else "Aucune donnée météo"
 
         prompt = f"""Tu es expert en marchés de prédiction Polymarket. Analyse en français, sois direct.
 
@@ -384,13 +297,8 @@ MARCHÉS ACTIFS :
 DONNÉES MÉTÉO :
 {weather_text}
 
-Pour chaque marché :
-1. Traduction française (1 ligne)
-2. Signal OUI/NON/ABSTENTION + confiance %
-3. Raison en 1 phrase
-4. Edge potentiel (pourquoi c'est une opportunité)
-
-Classe du meilleur edge au pire. Commence directement par le n°1."""
+Pour chaque marché : signal OUI/NON/ABSTENTION + confiance % + raison 1 phrase + edge potentiel.
+Classe du meilleur edge au pire."""
 
     msg = client.messages.create(
         model="claude-sonnet-4-6",
